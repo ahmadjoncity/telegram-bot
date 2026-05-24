@@ -467,7 +467,7 @@ bot.on("message", async (msg) => {
         message: h.content
       }));
       const response = await cohere.chat({
-        model: "command-r",
+        model: "command-a-03-2025",
         message: userText,
         chatHistory: cohereHistory,
       });
