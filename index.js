@@ -203,7 +203,7 @@ bot.on("callback_query", async (query) => {
     const paymeUrl = `https://checkout.paycom.uz/${PAYME_MERCHANT_ID}?amount=${PREMIUM_PRICE_UZS * 100}&detail.description=Premium_${userId}`;
     bot.sendMessage(query.message.chat.id,
       `💳 *Payme orqali to'lash*\n\n👇 Havolaga o'ting:\n${paymeUrl}\n\n✅ To'lovdan keyin /paid yuboring!`,
-      { parse_mode: "Markdown" }
+      { parse_mode: "HTML" }
     );
     return;
   }
@@ -214,7 +214,7 @@ bot.on("callback_query", async (query) => {
     const clickUrl = `https://my.click.uz/services/pay?service_id=${CLICK_MERCHANT_ID}&merchant_id=${CLICK_MERCHANT_ID}&amount=${PREMIUM_PRICE_UZS}&transaction_param=${userId}`;
     bot.sendMessage(query.message.chat.id,
       `💳 *Click orqali to'lash*\n\n👇 Havolaga o'ting:\n${clickUrl}\n\n✅ To'lovdan keyin /paid yuboring!`,
-      { parse_mode: "Markdown" }
+      { parse_mode: "HTML" }
     );
     return;
   }
@@ -240,9 +240,8 @@ bot.on("callback_query", async (query) => {
     bot.editMessageText(`✅ *${targetId}* ga Premium berildi!`, {
       chat_id: query.message.chat.id,
       message_id: query.message.message_id,
-      parse_mode: "Markdown"
-    });
-    bot.sendMessage(targetId, `🎉 *Premium* faollashtirildi!\n\n✅ 1 oy cheksiz foydalaning!`, { parse_mode: "Markdown" });
+parse_mode: "HTML"    });
+    bot.sendMessage(targetId, `🎉 *Premium* faollashtirildi!\n\n✅ 1 oy cheksiz foydalaning!`, { parse_mode: "HTML" });
     return;
   }
 });
@@ -278,7 +277,7 @@ bot.on("message", async (msg) => {
   if (!canUseBot(userId)) {
     return bot.sendMessage(userId,
       `⛔ *Bepul muddat tugadi!*\n\n${FREE_DAYS} kunlik bepul foydalanish muddati tugadi.\n\n💎 Premium oling — cheksiz foydalaning!\n/premium`,
-      { parse_mode: "Markdown" }
+      { parse_mode: "HTML" }
     );
   }
 
@@ -301,7 +300,7 @@ function showTasks(msg) {
   bot.sendMessage(msg.chat.id,
     `📋 *Vazifalar ro'yxati*\n\nQuyidagi vazifalardan birini tanlang:`,
     {
-      parse_mode: "Markdown",
+      parse_mode: "HTML",
       reply_markup: {
         inline_keyboard: [
           [{ text: "✍️ Matn yozish", callback_data: "task_write" }],
@@ -335,7 +334,7 @@ bot.on("callback_query", async (query) => {
 
   if (taskMessages[data]) {
     bot.answerCallbackQuery(query.id);
-    bot.sendMessage(query.message.chat.id, taskMessages[data], { parse_mode: "Markdown" });
+    bot.sendMessage(query.message.chat.id, taskMessages[data], { parse_mode: "HTML"});
     return;
   }
 
