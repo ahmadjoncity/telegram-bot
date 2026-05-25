@@ -82,19 +82,24 @@ bot.onText(/\/start/, async (msg) => {
   const id = msg.from.id;
   const name = msg.from.first_name || "Do'stim";
   setUser(id, { name, username: msg.from.username || "" });
- 
-  if (id !== ADMIN_ID) {
+ if (id !== ADMIN_ID) {
     const ok = await subOk(id);
     if (!ok) {
       return bot.sendMessage(id,
-        "Salom " + name + "!\n\nBotdan foydalanish uchun avval kanalga obuna bo'ling:\n" + CHANNEL,
-        { reply_markup: { inline_keyboard: [
-          [{ text: "Kanalga kirish", url: "https://t.me/" + CHANNEL.replace("@","") }],
-          [{ text: "Obunani tekshirish ✅", callback_data: "checksub" }]
-        ]}}
+        "Salom " + name + "!\n\nBotdan foydalanish uchun:\n\n1. Telegram kanalga obuna buling\n2. Instagram da follow bosing\n\nKeyin Tekshirish tugmasini bosing!",
+        {
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: "Telegram kanal", url: "https://t.me/ustozaka_ai" }],
+              [{ text: "Instagram", url: "https://instagram.com/ustozainews" }],
+              [{ text: "Obunani tekshirish ✅", callback_data: "checksub" }]
+            ]
+          }
+        }
       );
     }
   }
+  
  
   const d = daysLeft(id);
   const prem = isPremium(id);
