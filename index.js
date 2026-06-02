@@ -2,7 +2,12 @@ require("dotenv").config();
 const TelegramBot = require("node-telegram-bot-api");
 const Groq = require("groq-sdk");
 const { CohereClient } = require("cohere-ai");
-const Anthropic = require("@anthropic-ai/sdk");
+let Anthropic = null;
+try {
+  Anthropic = require("@anthropic-ai/sdk");
+} catch (e) {
+  console.warn("[OGOHLANTIRISH] @anthropic-ai/sdk topilmadi - Claude o'chirilgan. 'npm install' ni ishga tushiring.");
+}
 const fs = require("fs");
  
 const BOT_TOKEN = process.env.TELEGRAM_TOKEN;
@@ -87,7 +92,7 @@ function canUse(id) {
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 const groq = new Groq({ apiKey: GROQ_KEY });
 const cohere = new CohereClient({ token: COHERE_KEY });
-const anthropic = ANTHROPIC_KEY ? new Anthropic({ apiKey: ANTHROPIC_KEY }) : null;
+const anthropic = (ANTHROPIC_KEY && Anthropic) ? new Anthropic({ apiKey: ANTHROPIC_KEY }) : null;
 const histories = new Map();
 const models = new Map();
 const pendingAction = new Map(); // id -> "image" | "video"
