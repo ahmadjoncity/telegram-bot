@@ -1,0 +1,22 @@
+# ---- Maxfiy fayllar (HECH QACHON commit qilinmaydi!) ----
+.env
+.env.*
+!.env.example
+
+# ---- Bot ma'lumotlar bazasi (foydalanuvchilar) ----
+db.json
+
+# ---- Node ----
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+pnpm-lock.yaml
+
+# ---- Tizim / IDE ----
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.log
