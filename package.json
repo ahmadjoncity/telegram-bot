@@ -1,19 +1,30 @@
 {
-  "name": "telegram-gemini-bot",
-  "version": "1.0.0",
-  "description": "",
+  "name": "ustoz-aka-ai-bot",
+  "version": "2.0.0",
+  "description": "Ustoz AKA AI - ko'p funksiyali Telegram AI bot (chat, rasm yaratish, vision, ovoz, chek bilan to'lov, referal)",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node index.js",
+    "dev": "node index.js",
+    "check": "node --check index.js"
   },
-  "keywords": [],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "telegram",
+    "bot",
+    "ai",
+    "groq",
+    "cohere",
+    "image-generation"
+  ],
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "@google/generative-ai": "^0.24.1",
+    "cohere-ai": "^7.10.0",
     "dotenv": "^17.4.2",
     "groq-sdk": "^1.2.0",
-   "node-telegram-bot-api": "^0.67.0",
-    "cohere-ai": "^7.10.0"
+    "node-telegram-bot-api": "^0.67.0"
   }
 }
