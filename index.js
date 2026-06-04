@@ -1,449 +1,888 @@
-require("dotenv").config();
-const TelegramBot = require("node-telegram-bot-api");
-const Groq = require("groq-sdk");
-const { CohereClient } = require("cohere-ai");
+// ============================================================
+//  Ustoz AKA AI — Telegram bot (yangilangan, kuchaytirilgan)
+//  Imkoniyatlar: AI chat (Groq/Cohere), rasm yaratish, rasm tahlili,
+//  ovozni matnga aylantirish, chek bilan to'lov, referal, admin panel.
+// ============================================================
 const fs = require("fs");
- 
-const BOT_TOKEN = process.env.TELEGRAM_TOKEN;
-const GROQ_KEY = process.env.GROQ_API_KEY;
-const COHERE_KEY = process.env.COHERE_API_KEY;
-const ADMIN_ID = parseInt(process.env.ADMIN_ID) || 0;
-const CHANNEL = process.env.REQUIRED_CHANNEL || "@ustozaka_ai";
-const FREE_DAYS = 20;
-const PREMIUM_SOM = 15000;
-const STARS = 50;
-const DB = "db.json";
- 
-function loadDB() {
-  if (!fs.existsSync(DB)) fs.writeFileSync(DB, JSON.stringify({users:{},msgs:[]}));
-  try { return JSON.parse(fs.readFileSync(DB)); } catch { return {users:{},msgs:[]}; }
+const os = require("os");
+const path = require("path");
+const TelegramBot = require("node-telegram-bot-api");
+
+const config = require("./src/config");
+const db = require("./src/db");
+const ai = require("./src/ai");
+const kb = require("./src/keyboards");
+
+// ---- Token tekshiruvi ----
+if (!config.BOT_TOKEN) {
+  console.error("❌ TELEGRAM_TOKEN topilmadi! .env faylini to'ldiring.");
+  process.exit(1);
 }
-function saveDB(db) { fs.writeFileSync(DB, JSON.stringify(db, null, 2)); }
- 
-function getUser(id) {
-  const db = loadDB();
-  if (!db.users[id]) {
-    db.users[id] = { id, name:"", username:"", count:0, premium:false, premiumUntil:null, joined: new Date().toISOString() };
-    saveDB(db);
-  }
-  return db.users[id];
+
+const bot = new TelegramBot(config.BOT_TOKEN, {
+  polling: { interval: 300, autoStart: true, params: { timeout: 30 } },
+});
+
+// Vaqtinchalik holatlar (rasm/chek kutilmoqda) — xotirada
+const state = new Map(); // userId -> { type: 'image'|'receipt', method?, t }
+// Suhbat tarixi — xotirada
+const histories = new Map(); // userId -> [{role, content}]
+
+let BOT_USERNAME = "";
+
+// ============================================================
+//  YORDAMCHI FUNKSIYALAR
+// ============================================================
+function isAdmin(id) {
+  return id === config.ADMIN_ID;
 }
-function setUser(id, data) {
-  const db = loadDB();
-  db.users[id] = Object.assign({}, db.users[id], data);
-  saveDB(db);
-}
-function addMsg(id, name, uname, text, model) {
-  const db = loadDB();
-  if (!db.msgs) db.msgs = [];
-  db.msgs.push({ id, name, uname, text: text.slice(0,150), model, t: new Date().toISOString() });
-  if (db.msgs.length > 1000) db.msgs = db.msgs.slice(-1000);
-  saveDB(db);
-}
+
 function isPremium(id) {
-  if (id === ADMIN_ID) return true;
-  const u = getUser(id);
-  return u.premium && u.premiumUntil && new Date(u.premiumUntil) > new Date();
+  if (isAdmin(id)) return true;
+  const u = db.getUser(id);
+  return !!(u.premium && u.premiumUntil && new Date(u.premiumUntil) > new Date());
 }
+
 function daysLeft(id) {
-  const u = getUser(id);
-  const diff = (Date.now() - new Date(u.joined)) / 86400000;
-  return Math.max(0, FREE_DAYS - Math.floor(diff));
+  const u = db.getUser(id);
+  const elapsed = (Date.now() - new Date(u.joined).getTime()) / 86400000;
+  return Math.max(0, config.FREE_DAYS + (u.bonusDays || 0) - Math.floor(elapsed));
 }
+
 function canUse(id) {
-  if (id === ADMIN_ID) return true;
-  if (isPremium(id)) return true;
+  if (isAdmin(id) || isPremium(id)) return true;
   return daysLeft(id) > 0;
 }
- 
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
-const groq = new Groq({ apiKey: GROQ_KEY });
-const cohere = new CohereClient({ token: COHERE_KEY });
-const histories = new Map();
-const models = new Map();
- 
-async function subOk(id) {
-  try {
-    const m = await bot.getChatMember(CHANNEL, id);
-    return ["member","administrator","creator"].includes(m.status);
-  } catch { return false; }
+
+function canGenerateImage(id) {
+  if (isAdmin(id) || isPremium(id)) return { ok: true };
+  if (!canUse(id)) return { ok: false, reason: "trial" };
+  const u = db.getUser(id);
+  const today = new Date().toDateString();
+  const used = u.imageDay === today ? u.imageDayCount || 0 : 0;
+  if (used >= config.FREE_IMAGE_PER_DAY) return { ok: false, reason: "daily", used };
+  return { ok: true };
 }
- 
-const MENU = {
-  keyboard: [
-    [{ text: "🤖 Savol berish" }, { text: "⚙️ AI tanlash" }],
-    [{ text: "📋 Vazifalar" }, { text: "📊 Hisobim" }],
-    [{ text: "💎 Premium" }, { text: "ℹ️ Yordam" }]
-  ],
-  resize_keyboard: true
-};
- 
-bot.onText(/\/start/, async (msg) => {
-  const id = msg.from.id;
-  const name = msg.from.first_name || "Do'stim";
-  setUser(id, { name, username: msg.from.username || "" });
- if (id !== ADMIN_ID) {
-    const ok = await subOk(id);
-    if (!ok) {
-      return bot.sendMessage(id,
-        "Salom " + name + "!\n\nBotdan foydalanish uchun:\n\n1. Telegram kanalga obuna buling\n2. Instagram da follow bosing\n\nKeyin Tekshirish tugmasini bosing!",
-        {
-          reply_markup: {
-            inline_keyboard: [
-              [{ text: "Telegram kanal", url: "https://t.me/ustozaka_ai" }],
-              [{ text: "Instagram", url: "https://instagram.com/ustozainews" }],
-              [{ text: "Obunani tekshirish ✅", callback_data: "checksub" }]
-            ]
-          }
+
+function markImageUse(id) {
+  const u = db.getUser(id);
+  const today = new Date().toDateString();
+  const used = u.imageDay === today ? u.imageDayCount || 0 : 0;
+  db.setUser(id, { imageDay: today, imageDayCount: used + 1, imageCount: (u.imageCount || 0) + 1 });
+  db.incImageStat();
+}
+
+async function subOk(id) {
+  if (isAdmin(id)) return true;
+  try {
+    const m = await bot.getChatMember(config.CHANNEL, id);
+    return ["member", "administrator", "creator"].includes(m.status);
+  } catch {
+    return false;
+  }
+}
+
+async function safeSend(chatId, text, options) {
+  try {
+    return await bot.sendMessage(chatId, text, options);
+  } catch (e) {
+    console.error("[send] xato:", chatId, e.message);
+    return null;
+  }
+}
+
+async function sendLong(chatId, text, options) {
+  const chunks = text.match(new RegExp(`[\\s\\S]{1,${config.MAX_MSG_LEN}}`, "g")) || [""];
+  for (let i = 0; i < chunks.length; i++) {
+    await safeSend(chatId, chunks[i], i === chunks.length - 1 ? options : undefined);
+  }
+}
+
+function grantPremium(userId, months) {
+  const u = db.getUser(userId);
+  const base = isPremium(userId) && u.premiumUntil ? new Date(u.premiumUntil) : new Date();
+  base.setMonth(base.getMonth() + (months || config.PREMIUM_MONTHS));
+  db.setUser(userId, { premium: true, premiumUntil: base.toISOString() });
+  return base;
+}
+
+function getHistory(id) {
+  if (!histories.has(id)) histories.set(id, []);
+  return histories.get(id);
+}
+
+function pushHistory(id, role, content) {
+  const h = getHistory(id);
+  h.push({ role, content });
+  // tarixni cheklash
+  while (h.length > config.HISTORY_LIMIT) h.shift();
+}
+
+// Obuna talab qiluvchi to'siq. true qaytsa — to'xtatish kerak.
+async function gateSubscription(id) {
+  if (await subOk(id)) return false;
+  await safeSend(
+    id,
+    "❗️ Botdan foydalanish uchun avval kanalga obuna bo'ling va Instagram'da follow qiling, so'ng tekshiring:",
+    { reply_markup: kb.subscribeKeyboard() }
+  );
+  return true;
+}
+
+// ============================================================
+//  /start  (+ referal)
+// ============================================================
+bot.onText(/^\/start(?:\s+(.+))?$/, async (msg, match) => {
+  try {
+    const id = msg.from.id;
+    if (msg.chat.type !== "private") return;
+    const name = msg.from.first_name || "Do'stim";
+    const payload = (match && match[1] ? match[1] : "").trim();
+
+    const existedBefore = !!db.loadDB().users[id];
+    db.setUser(id, { name, username: msg.from.username || "" });
+
+    // Referal hisoblash (faqat yangi foydalanuvchi uchun)
+    if (!existedBefore && payload) {
+      const refId = parseInt(payload.replace(/\D/g, ""), 10);
+      if (refId && refId !== id && db.loadDB().users[refId]) {
+        const ref = db.getUser(refId);
+        const refs = Array.isArray(ref.referrals) ? ref.referrals : [];
+        if (!refs.includes(id)) {
+          refs.push(id);
+          db.setUser(refId, { referrals: refs, bonusDays: (ref.bonusDays || 0) + config.REFERRAL_BONUS_DAYS });
+          db.setUser(id, { referredBy: refId });
+          safeSend(
+            refId,
+            `🎉 Sizning havolangiz orqali yangi do'st qo'shildi!\n+${config.REFERRAL_BONUS_DAYS} kun bepul muddat berildi.`
+          );
         }
+      }
+    }
+
+    const u = db.getUser(id);
+    if (u.banned) return;
+
+    if (await gateSubscription(id)) return;
+
+    const prem = isPremium(id);
+    await safeSend(
+      id,
+      `👋 Salom, ${name}! Xush kelibsiz!\n\n` +
+        `Men "Ustoz AKA AI" — savollaringizga javob beraman, rasm yarataman, ` +
+        `rasm va ovozli xabarlarni tahlil qilaman.\n\n` +
+        (prem ? "💎 Premium faol — cheksiz foydalaning!" : `🎁 Bepul muddat: ${daysLeft(id)} kun qoldi`) +
+        "\n\nQuyidagi menyudan tanlang 👇",
+      { reply_markup: kb.mainMenu }
+    );
+  } catch (e) {
+    console.error("[/start]", e.message);
+  }
+});
+
+// ============================================================
+//  Oddiy buyruqlar
+// ============================================================
+bot.onText(/^\/reset$/, (msg) => {
+  histories.delete(msg.from.id);
+  state.delete(msg.from.id);
+  safeSend(msg.chat.id, "🧹 Suhbat tarixi tozalandi!", { reply_markup: kb.mainMenu });
+});
+
+bot.onText(/^\/cancel$/, (msg) => {
+  state.delete(msg.from.id);
+  safeSend(msg.chat.id, "✖️ Bekor qilindi.", { reply_markup: kb.mainMenu });
+});
+
+bot.onText(/^\/premium$/, (msg) => showPremium(msg.chat.id, msg.from.id));
+
+bot.onText(/^\/help$/, (msg) => showHelp(msg.chat.id));
+
+bot.onText(/^\/image\s+(.+)$/s, async (msg, match) => {
+  if (msg.chat.type !== "private") return;
+  if (await gateSubscription(msg.from.id)) return;
+  await handleImageRequest(msg.from.id, match[1]);
+});
+
+// ============================================================
+//  ADMIN buyruqlari
+// ============================================================
+bot.onText(/^\/admin$/, (msg) => {
+  if (!isAdmin(msg.from.id)) return;
+  safeSend(msg.chat.id, "🛠 Admin panel:", { reply_markup: kb.adminPanel });
+});
+
+bot.onText(/^\/stats$/, (msg) => {
+  if (!isAdmin(msg.from.id)) return;
+  safeSend(msg.chat.id, statsText());
+});
+
+bot.onText(/^\/users$/, (msg) => {
+  if (!isAdmin(msg.from.id)) return;
+  safeSend(msg.chat.id, usersText());
+});
+
+bot.onText(/^\/messages$/, (msg) => {
+  if (!isAdmin(msg.from.id)) return;
+  safeSend(msg.chat.id, messagesText());
+});
+
+bot.onText(/^\/pending$/, (msg) => {
+  if (!isAdmin(msg.from.id)) return;
+  safeSend(msg.chat.id, pendingText());
+});
+
+bot.onText(/^\/find\s+(.+)$/, (msg, match) => {
+  if (!isAdmin(msg.from.id)) return;
+  const q = match[1].trim().toLowerCase();
+  const found = db.allUsers().filter(
+    (u) =>
+      String(u.id).includes(q) ||
+      (u.username || "").toLowerCase().includes(q) ||
+      (u.name || "").toLowerCase().includes(q)
+  );
+  if (!found.length) return safeSend(msg.chat.id, "Topilmadi.");
+  let t = "🔎 Topildi:\n\n";
+  found.slice(0, 20).forEach((u) => {
+    t += `${isPremium(u.id) ? "💎" : "🆓"} ${u.name || "-"} @${u.username || "yo'q"} | ${u.id} | ${u.count || 0} xabar\n`;
+  });
+  safeSend(msg.chat.id, t);
+});
+
+bot.onText(/^\/givepremium\s+(\d+)(?:\s+(\d+))?$/, (msg, match) => {
+  if (!isAdmin(msg.from.id)) return;
+  const tid = parseInt(match[1], 10);
+  const months = match[2] ? parseInt(match[2], 10) : config.PREMIUM_MONTHS;
+  const until = grantPremium(tid, months);
+  safeSend(msg.chat.id, `✅ ${tid} ga ${months} oy Premium berildi. Tugash: ${until.toLocaleDateString()}`);
+  safeSend(tid, `💎 Sizga Premium faollashtirildi! Muddat: ${until.toLocaleDateString()}`);
+});
+
+bot.onText(/^\/revoke\s+(\d+)$/, (msg, match) => {
+  if (!isAdmin(msg.from.id)) return;
+  const tid = parseInt(match[1], 10);
+  db.setUser(tid, { premium: false, premiumUntil: null });
+  safeSend(msg.chat.id, `🚫 ${tid} dan Premium olib tashlandi.`);
+});
+
+bot.onText(/^\/adddays\s+(\d+)\s+(\d+)$/, (msg, match) => {
+  if (!isAdmin(msg.from.id)) return;
+  const tid = parseInt(match[1], 10);
+  const days = parseInt(match[2], 10);
+  const u = db.getUser(tid);
+  db.setUser(tid, { bonusDays: (u.bonusDays || 0) + days });
+  safeSend(msg.chat.id, `✅ ${tid} ga +${days} kun qo'shildi.`);
+  safeSend(tid, `🎁 Sizga +${days} kun bepul muddat berildi!`);
+});
+
+bot.onText(/^\/ban\s+(\d+)$/, (msg, match) => {
+  if (!isAdmin(msg.from.id)) return;
+  const tid = parseInt(match[1], 10);
+  db.setUser(tid, { banned: true });
+  safeSend(msg.chat.id, `🚫 ${tid} bloklandi.`);
+});
+
+bot.onText(/^\/unban\s+(\d+)$/, (msg, match) => {
+  if (!isAdmin(msg.from.id)) return;
+  const tid = parseInt(match[1], 10);
+  db.setUser(tid, { banned: false });
+  safeSend(msg.chat.id, `✅ ${tid} blokdan chiqarildi.`);
+});
+
+bot.onText(/^\/broadcast\s+([\s\S]+)$/, async (msg, match) => {
+  if (!isAdmin(msg.from.id)) return;
+  await broadcast(msg.chat.id, { text: match[1] });
+});
+
+// ============================================================
+//  CALLBACK QUERY
+// ============================================================
+bot.on("callback_query", async (q) => {
+  try {
+    const id = q.from.id;
+    const data = q.data || "";
+    const chatId = q.message ? q.message.chat.id : id;
+
+    // Obunani tekshirish
+    if (data === "checksub") {
+      if (await subOk(id)) {
+        bot.answerCallbackQuery(q.id, { text: "✅ Tasdiqlandi!" });
+        try { await bot.deleteMessage(chatId, q.message.message_id); } catch {}
+        await safeSend(
+          id,
+          `✅ Obuna tasdiqlandi!\n\n🎁 Bepul muddat: ${daysLeft(id)} kun\n\nMenyudan foydalaning:`,
+          { reply_markup: kb.mainMenu }
+        );
+      } else {
+        bot.answerCallbackQuery(q.id, { text: "❌ Hali to'liq obuna bo'lmadingiz!", show_alert: true });
+      }
+      return;
+    }
+
+    // AI model tanlash
+    if (data.startsWith("model_")) {
+      const m = data.replace("model_", "");
+      db.setUser(id, { model: m });
+      histories.delete(id);
+      bot.answerCallbackQuery(q.id, { text: "AI tanlandi!" });
+      const labels = { groq: "Llama 3.3 70B", fast: "Llama 3.1 8B (tezkor)", cohere: "Cohere Command" };
+      await safeSend(chatId, `✅ Tanlandi: ${labels[m] || m}`);
+      return;
+    }
+
+    // Vazifa promptlari
+    if (data.startsWith("task_")) {
+      const key = data.replace("task_", "");
+      bot.answerCallbackQuery(q.id);
+      if (kb.TASK_PROMPTS[key]) await safeSend(chatId, kb.TASK_PROMPTS[key]);
+      return;
+    }
+
+    // To'lov usullari
+    if (data === "pay_card") {
+      bot.answerCallbackQuery(q.id);
+      state.set(id, { type: "receipt", method: "Karta", t: Date.now() });
+      await safeSend(
+        chatId,
+        `💳 Karta orqali to'lov:\n\n` +
+          `Karta: <code>${config.CARD_NUMBER}</code>\n` +
+          `Egasi: ${config.CARD_HOLDER}\n` +
+          `Summa: ${config.PREMIUM_SOM.toLocaleString()} so'm\n\n` +
+          `➡️ To'lovni amalga oshirgach, CHEK (skrinshot yoki rasm) ni shu yerga yuboring. ` +
+          `Admin tekshirib, Premium faollashtiradi.`,
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+    if (data === "pay_payme") {
+      bot.answerCallbackQuery(q.id);
+      state.set(id, { type: "receipt", method: "Payme", t: Date.now() });
+      await safeSend(
+        chatId,
+        `🔵 Payme orqali to'lash:\nhttps://checkout.paycom.uz/${config.PAYME_MERCHANT_ID}\n\n` +
+          `Summa: ${config.PREMIUM_SOM.toLocaleString()} so'm\n\n➡️ To'lovdan keyin CHEKni shu yerga yuboring.`
+      );
+      return;
+    }
+    if (data === "pay_click") {
+      bot.answerCallbackQuery(q.id);
+      state.set(id, { type: "receipt", method: "Click", t: Date.now() });
+      await safeSend(
+        chatId,
+        `🟢 Click orqali to'lash:\n` +
+          `https://my.click.uz/services/pay?service_id=${config.CLICK_MERCHANT_ID}&amount=${config.PREMIUM_SOM}&transaction_param=${id}\n\n` +
+          `➡️ To'lovdan keyin CHEKni shu yerga yuboring.`
+      );
+      return;
+    }
+    if (data === "pay_stars") {
+      bot.answerCallbackQuery(q.id);
+      try {
+        await bot.sendInvoice(
+          chatId,
+          "Premium obuna",
+          `${config.PREMIUM_MONTHS} oylik cheksiz foydalanish`,
+          "prem_" + id,
+          "XTR",
+          [{ label: "Premium", amount: config.STARS }]
+        );
+      } catch (e) {
+        await safeSend(chatId, "Stars to'lovini boshlashda xatolik. Boshqa usulni tanlang.");
+      }
+      return;
+    }
+
+    // Admin: to'lovni tasdiqlash / rad etish
+    if (data.startsWith("payok_") && isAdmin(id)) {
+      const pid = data.replace("payok_", "");
+      const p = db.getPayment(pid);
+      if (!p) { bot.answerCallbackQuery(q.id, { text: "Topilmadi" }); return; }
+      if (p.status !== "pending") { bot.answerCallbackQuery(q.id, { text: "Allaqachon ko'rib chiqilgan" }); return; }
+      db.setPaymentStatus(pid, "approved");
+      const until = grantPremium(p.userId, config.PREMIUM_MONTHS);
+      bot.answerCallbackQuery(q.id, { text: "✅ Tasdiqlandi" });
+      await safeSend(chatId, `✅ To'lov tasdiqlandi. ${p.userId} ga Premium berildi.`);
+      await safeSend(p.userId, `🎉 To'lovingiz tasdiqlandi! 💎 Premium faol.\nMuddat: ${until.toLocaleDateString()}`);
+      return;
+    }
+    if (data.startsWith("payno_") && isAdmin(id)) {
+      const pid = data.replace("payno_", "");
+      const p = db.getPayment(pid);
+      if (!p) { bot.answerCallbackQuery(q.id, { text: "Topilmadi" }); return; }
+      if (p.status !== "pending") { bot.answerCallbackQuery(q.id, { text: "Allaqachon ko'rib chiqilgan" }); return; }
+      db.setPaymentStatus(pid, "rejected");
+      bot.answerCallbackQuery(q.id, { text: "❌ Rad etildi" });
+      await safeSend(chatId, `❌ To'lov rad etildi (${p.userId}).`);
+      await safeSend(p.userId, "❌ To'lovingiz tasdiqlanmadi. To'g'ri chek yuboring yoki admin bilan bog'laning.");
+      return;
+    }
+
+    // Admin panel tugmalari
+    if (data === "adm_stats" && isAdmin(id)) { bot.answerCallbackQuery(q.id); await safeSend(chatId, statsText()); return; }
+    if (data === "adm_users" && isAdmin(id)) { bot.answerCallbackQuery(q.id); await safeSend(chatId, usersText()); return; }
+    if (data === "adm_msgs" && isAdmin(id)) { bot.answerCallbackQuery(q.id); await safeSend(chatId, messagesText()); return; }
+    if (data === "adm_pending" && isAdmin(id)) { bot.answerCallbackQuery(q.id); await safeSend(chatId, pendingText()); return; }
+
+    bot.answerCallbackQuery(q.id);
+  } catch (e) {
+    console.error("[callback]", e.message);
+    try { bot.answerCallbackQuery(q.id); } catch {}
+  }
+});
+
+// ============================================================
+//  ASOSIY XABAR HANDLER
+// ============================================================
+bot.on("message", async (msg) => {
+  try {
+    if (!msg || !msg.from) return;
+    if (msg.chat.type !== "private") return;
+    const id = msg.from.id;
+
+    // Buyruqlar onText orqali ishlanadi
+    if (msg.text && msg.text.startsWith("/")) return;
+
+    const user = db.getUser(id);
+    if (user.banned && !isAdmin(id)) return;
+
+    // --- Admin ommaviy media yuborishi ---
+    if (isAdmin(id) && (msg.photo || msg.video) && msg.caption) {
+      if (msg.caption.startsWith("/sendphoto")) {
+        await broadcast(id, { photo: msg.photo[msg.photo.length - 1].file_id, caption: msg.caption.replace("/sendphoto", "").trim() });
+        return;
+      }
+      if (msg.caption.startsWith("/sendvideo")) {
+        await broadcast(id, { video: msg.video.file_id, caption: msg.caption.replace("/sendvideo", "").trim() });
+        return;
+      }
+    }
+
+    // --- Obuna to'sig'i ---
+    if (await gateSubscription(id)) return;
+
+    db.setUser(id, { name: msg.from.first_name || "", username: msg.from.username || "", lastMsg: new Date().toISOString() });
+
+    // --- CHEK (rasm) — to'lov holatida ---
+    const st = state.get(id);
+    if (msg.photo && st && st.type === "receipt") {
+      await handleReceipt(msg, st);
+      state.delete(id);
+      return;
+    }
+
+    // --- Ovozli xabar ---
+    if (msg.voice || msg.audio) {
+      await handleVoice(msg);
+      return;
+    }
+
+    // --- Rasm yuborildi -> tahlil (vision) ---
+    if (msg.photo) {
+      await handleVision(msg);
+      return;
+    }
+
+    if (!msg.text) return;
+    const text = msg.text.trim();
+
+    // --- Menyu tugmalari ---
+    const MENU_BUTTONS = [
+      "🤖 Savol berish", "🎨 Rasm yaratish", "📋 Vazifalar", "⚙️ AI tanlash",
+      "📊 Hisobim", "💎 Premium", "👥 Do'st taklif qilish", "ℹ️ Yordam",
+    ];
+    if (MENU_BUTTONS.includes(text)) {
+      state.delete(id); // menyu bosilsa har qanday kutish holatini bekor qilamiz
+      return handleMenu(id, text);
+    }
+
+    // --- Rasm yaratish holati ---
+    if (st && st.type === "image") {
+      state.delete(id);
+      return handleImageRequest(id, text);
+    }
+
+    // --- Aks holda: AI chat ---
+    if (!canUse(id)) return sendLimitMessage(id);
+    await handleChat(msg, text);
+  } catch (e) {
+    console.error("[message]", e.message);
+  }
+});
+
+// ============================================================
+//  MENYU
+// ============================================================
+async function handleMenu(id, text) {
+  switch (text) {
+    case "🤖 Savol berish":
+      return safeSend(id, "✍️ Savolingizni yozing, men javob beraman!", { reply_markup: kb.mainMenu });
+
+    case "🎨 Rasm yaratish": {
+      const chk = canGenerateImage(id);
+      if (!chk.ok) return sendImageLimit(id, chk);
+      state.set(id, { type: "image", t: Date.now() });
+      return safeSend(id, "🎨 Qanday rasm yaratay? Tasvirlab yozing.\nMasalan: tog' cho'qqisidagi quyosh chiqishi, realistik.");
+    }
+
+    case "📋 Vazifalar":
+      return safeSend(id, "📋 Vazifani tanlang:", { reply_markup: kb.tasksKeyboard });
+
+    case "⚙️ AI tanlash": {
+      const u = db.getUser(id);
+      return safeSend(id, "⚙️ Qaysi AI modelidan foydalanasiz?", { reply_markup: kb.aiSelectKeyboard(u.model || "groq") });
+    }
+
+    case "📊 Hisobim": {
+      const u = db.getUser(id);
+      const prem = isPremium(id);
+      const until = u.premiumUntil ? new Date(u.premiumUntil).toLocaleDateString() : "-";
+      return safeSend(
+        id,
+        "📊 Hisobingiz:\n\n" +
+          `👤 Ism: ${u.name || "-"}\n` +
+          `🆔 ID: ${id}\n` +
+          `📌 Status: ${prem ? "Premium 💎" : "Bepul 🆓"}\n` +
+          (prem ? `📅 Muddat: ${until}\n` : `🎁 Qoldi: ${daysLeft(id)} kun\n`) +
+          `💬 Xabarlar: ${u.count || 0}\n` +
+          `🎨 Rasmlar: ${u.imageCount || 0}\n` +
+          `👥 Takliflar: ${(u.referrals || []).length}`,
+        { reply_markup: kb.mainMenu }
       );
     }
+
+    case "💎 Premium":
+      return showPremium(id, id);
+
+    case "👥 Do'st taklif qilish": {
+      const u = db.getUser(id);
+      const link = BOT_USERNAME ? `https://t.me/${BOT_USERNAME}?start=${id}` : `(bot ishga tushmoqda...)`;
+      return safeSend(
+        id,
+        "👥 Do'stlaringizni taklif qiling!\n\n" +
+          `Har bir do'st sizning havolangiz orqali qo'shilsa, sizga +${config.REFERRAL_BONUS_DAYS} kun bepul muddat beriladi.\n\n` +
+          `🔗 Havolangiz:\n${link}\n\n` +
+          `✅ Hozircha takliflar: ${(u.referrals || []).length}`,
+        { reply_markup: kb.mainMenu }
+      );
+    }
+
+    case "ℹ️ Yordam":
+      return showHelp(id);
   }
-  
- 
-  const d = daysLeft(id);
-  const prem = isPremium(id);
-  bot.sendMessage(id,
-    "Salom " + name + "! Xush kelibsiz!\n\n" +
-    (prem ? "💎 Premium faol" : "Bepul muddat: " + d + " kun qoldi") +
-    "\n\nQuyidagi menyudan foydalaning:",
-    { reply_markup: MENU }
-  );
-});
- 
-bot.onText(/\/reset/, (msg) => {
-  histories.delete(msg.from.id);
-  bot.sendMessage(msg.chat.id, "Suhbat tozalandi!", { reply_markup: MENU });
-});
- 
-bot.onText(/\/premium/, (msg) => showPremium(msg.chat.id, msg.from.id));
- 
-bot.onText(/\/paid/, (msg) => {
+}
+
+// ============================================================
+//  CHAT (AI matnli javob)
+// ============================================================
+async function handleChat(msg, text) {
   const id = msg.from.id;
-  bot.sendMessage(id, "To'lovingiz admin ko'rib chiqmoqda. Tez orada faollashtiriladi!");
-  if (ADMIN_ID) {
-    bot.sendMessage(ADMIN_ID,
-      "Yangi to'lov!\nIsm: " + (msg.from.first_name||"-") + "\nID: " + id,
-      { reply_markup: { inline_keyboard: [[{ text: "Premium ber ✅", callback_data: "giveprem_"+id }]] }}
-    );
-  }
-});
- 
-// Admin
-bot.onText(/\/stats/, (msg) => {
-  if (msg.from.id !== ADMIN_ID) return;
-  const db = loadDB();
-  const users = Object.values(db.users);
-  const prem = users.filter(u => isPremium(u.id)).length;
-  const today = new Date().toDateString();
-  const tm = (db.msgs||[]).filter(m => new Date(m.t).toDateString()===today).length;
-  bot.sendMessage(msg.chat.id,
-    "Statistika:\n\n" +
-    "Jami foydalanuvchi: " + users.length + "\n" +
-    "Premium: " + prem + "\n" +
-    "Bepul: " + (users.length-prem) + "\n\n" +
-    "Jami xabarlar: " + (db.msgs||[]).length + "\n" +
-    "Bugungi xabarlar: " + tm
-  );
-});
- 
-bot.onText(/\/users/, (msg) => {
-  if (msg.from.id !== ADMIN_ID) return;
-  const db = loadDB();
-  const users = Object.values(db.users).slice(-20);
-  if (!users.length) return bot.sendMessage(msg.chat.id, "Yo'q.");
-  let t = "Foydalanuvchilar:\n\n";
-  users.forEach((u,i) => {
-    t += (i+1)+". "+(isPremium(u.id)?"💎":"🆓")+" "+(u.name||"-")+" @"+(u.username||"yo'q")+" | "+u.id+" | "+u.count+" xabar\n";
-  });
-  bot.sendMessage(msg.chat.id, t);
-});
- 
-bot.onText(/\/messages/, (msg) => {
-  if (msg.from.id !== ADMIN_ID) return;
-  const db = loadDB();
-  const msgs = (db.msgs||[]).slice(-15).reverse();
-  if (!msgs.length) return bot.sendMessage(msg.chat.id, "Yo'q.");
-  let t = "Oxirgi xabarlar:\n\n";
-  msgs.forEach((m,i) => {
-    t += (i+1)+". "+(m.name||"-")+" ["+m.model+"]\n"+m.text.slice(0,60)+"\n\n";
-  });
-  bot.sendMessage(msg.chat.id, t);
-});
- 
-bot.onText(/\/givepremium (.+)/, (msg, match) => {
-  if (msg.from.id !== ADMIN_ID) return;
-  const tid = parseInt(match[1]);
-  if (isNaN(tid)) return bot.sendMessage(msg.chat.id, "Noto'g'ri ID!");
-  bot.sendMessage(msg.chat.id, tid+" ga Premium berishni tasdiqlaysizmi?", {
-    reply_markup: { inline_keyboard: [[{ text: "Ha, ber!", callback_data: "giveprem_"+tid }]] }
-  });
-});
- 
-bot.onText(/\/broadcast (.+)/, async (msg, match) => {
-  if (msg.from.id !== ADMIN_ID) return;
-  const text = match[1];
-  const db = loadDB();
-  const users = Object.values(db.users);
-  bot.sendMessage(msg.chat.id, users.length+" ga yuborilmoqda...");
-  let s=0, f=0;
-  for (const u of users) {
-    try { await bot.sendMessage(u.id, "Xabar:\n\n"+text); s++; } catch { f++; }
-    await new Promise(r=>setTimeout(r,100));
-  }
-  bot.sendMessage(msg.chat.id, "Yuborildi: "+s+"\nYuborilmadi: "+f);
-});
- 
-// Callback
-bot.on("callback_query", async (q) => {
-  const id = q.from.id;
-  const data = q.data;
- 
-  if (data === "checksub") {
-    const ok = await subOk(id);
-    if (ok) {
-      bot.answerCallbackQuery(q.id, { text: "Tasdiqlandi!" });
-      bot.deleteMessage(q.message.chat.id, q.message.message_id);
-      const d = daysLeft(id);
-      bot.sendMessage(id, "Obuna tasdiqlandi!\n\nBepul muddat: "+d+" kun\n\nMenyudan foydalaning:", { reply_markup: MENU });
-    } else {
-      bot.answerCallbackQuery(q.id, { text: "Hali obuna bo'lmadingiz!", show_alert: true });
-    }
-    return;
-  }
- 
-  if (data === "groq") {
-    models.set(id, "groq"); histories.delete(id);
-    bot.answerCallbackQuery(q.id, { text: "Groq tanlandi!" });
-    bot.sendMessage(q.message.chat.id, "Groq (Llama 3.3) tanlandi!");
-    return;
-  }
-  if (data === "cohere") {
-    models.set(id, "cohere"); histories.delete(id);
-    bot.answerCallbackQuery(q.id, { text: "Cohere tanlandi!" });
-    bot.sendMessage(q.message.chat.id, "Cohere tanlandi!");
-    return;
-  }
- 
-  if (data === "pay_payme") {
-    bot.answerCallbackQuery(q.id);
-    bot.sendMessage(q.message.chat.id, "Payme orqali to'lash:\nhttps://checkout.paycom.uz/"+process.env.PAYME_MERCHANT_ID+"\n\nTo'lovdan keyin /paid yuboring!");
-    return;
-  }
-  if (data === "pay_click") {
-    bot.answerCallbackQuery(q.id);
-    bot.sendMessage(q.message.chat.id, "Click orqali to'lash:\nhttps://my.click.uz/services/pay?service_id="+process.env.CLICK_MERCHANT_ID+"&amount="+PREMIUM_SOM+"&transaction_param="+id+"\n\nTo'lovdan keyin /paid yuboring!");
-    return;
-  }
-  if (data === "pay_stars") {
-    bot.answerCallbackQuery(q.id);
-    await bot.sendInvoice(q.message.chat.id, "Premium obuna", "1 oylik cheksiz foydalanish", "prem_"+id, "XTR", [{ label: "1 oy Premium", amount: STARS }]);
-    return;
-  }
- 
-  if (data.startsWith("giveprem_") && id === ADMIN_ID) {
-    const tid = parseInt(data.replace("giveprem_",""));
-    const until = new Date(); until.setMonth(until.getMonth()+1);
-    setUser(tid, { premium: true, premiumUntil: until.toISOString() });
-    bot.answerCallbackQuery(q.id, { text: "Premium berildi!" });
-    bot.sendMessage(q.message.chat.id, tid+" ga Premium berildi!");
-    bot.sendMessage(tid, "Premium faollashtirildi! 1 oy cheksiz foydalaning!");
-    return;
-  }
- 
-  const tasks = {
-    tw: "Qanday matn yozib berishimni xohlaysiz?\nMasalan: she'r yoz, xat yoz",
-    tt: "Qaysi matni qaysi tilga tarjima qilishimni?\nMasalan: Hello - uzbekchaga tarjima qil",
-    tc: "Qanday kod yozib berishimni?\nMasalan: Python da kalkulyator yoz",
-    ts: "Matningizni yuboring, xulosa chiqaraman!",
-    tm2: "Masalangizni yozing!\nMasalan: 2x+5=15, x ni top",
-    ti: "Qaysi mavzuda fikr kerak?\nMasalan: biznes g'oyalar ber",
-    te: "Nimani tushuntirishimni?\nMasalan: sun'iy intellekt nima",
-  };
-  if (tasks[data]) {
-    bot.answerCallbackQuery(q.id);
-    bot.sendMessage(q.message.chat.id, tasks[data]);
-  }
-});
- 
-// Xabarlar
-bot.on("message", async (msg) => {
-  const id = msg.from.id;
- 
-  // Rasm/video (admin)
-  if ((msg.photo || msg.video) && id === ADMIN_ID) {
-    const db = loadDB();
-    const users = Object.values(db.users);
-    if (msg.photo && msg.caption && msg.caption.startsWith("/sendphoto")) {
-      const cap = msg.caption.replace("/sendphoto","").trim();
-      const pid = msg.photo[msg.photo.length-1].file_id;
-      bot.sendMessage(id, users.length+" ga rasm yuborilmoqda...");
-      let s=0,f=0;
-      for (const u of users) {
-        try { await bot.sendPhoto(u.id, pid, { caption: cap }); s++; } catch { f++; }
-        await new Promise(r=>setTimeout(r,100));
-      }
-      bot.sendMessage(id, "Yuborildi: "+s+"\nYuborilmadi: "+f);
-      return;
-    }
-    if (msg.video && msg.caption && msg.caption.startsWith("/sendvideo")) {
-      const cap = msg.caption.replace("/sendvideo","").trim();
-      const vid = msg.video.file_id;
-      bot.sendMessage(id, users.length+" ga video yuborilmoqda...");
-      let s=0,f=0;
-      for (const u of users) {
-        try { await bot.sendVideo(u.id, vid, { caption: cap }); s++; } catch { f++; }
-        await new Promise(r=>setTimeout(r,100));
-      }
-      bot.sendMessage(id, "Yuborildi: "+s+"\nYuborilmadi: "+f);
-      return;
-    }
-    return;
-  }
- 
-  if (!msg.text) return;
-  const text = msg.text;
-  if (text.startsWith("/")) return;
- 
-  // Obuna tekshirish
-  if (id !== ADMIN_ID) {
-    const ok = await subOk(id);
-    if (!ok) {
-      return bot.sendMessage(id, "Botdan foydalanish uchun kanalga obuna bo'ling:\n"+CHANNEL, {
-        reply_markup: { inline_keyboard: [
-          [{ text: "Kanalga kirish", url: "https://t.me/"+CHANNEL.replace("@","") }],
-          [{ text: "Obunani tekshirish ✅", callback_data: "checksub" }]
-        ]}
-      });
-    }
-  }
- 
-  // Limit
-  if (!canUse(id)) {
-    return bot.sendMessage(id, "Bepul muddat tugadi!\n\nPremium oling - cheksiz foydalaning!\n/premium");
-  }
- 
-  // Menyu tugmalari
-  if (text === "🤖 Savol berish") return bot.sendMessage(id, "Savolingizni yozing!", { reply_markup: MENU });
- 
-  if (text === "⚙️ AI tanlash") {
-    const cur = models.get(id) || "groq";
-    return bot.sendMessage(id, "Qaysi AI ni tanlaysiz?", {
-      reply_markup: { inline_keyboard: [
-        [{ text: "Groq (Llama 3.3)"+(cur==="groq"?" ✅":""), callback_data: "groq" }],
-        [{ text: "Cohere"+(cur==="cohere"?" ✅":""), callback_data: "cohere" }],
-      ]}
-    });
-  }
- 
-  if (text === "📋 Vazifalar") {
-    return bot.sendMessage(id, "Vazifani tanlang:", {
-      reply_markup: { inline_keyboard: [
-        [{ text: "Matn yozish ✍️", callback_data: "tw" }],
-        [{ text: "Tarjima 🌐", callback_data: "tt" }],
-        [{ text: "Kod yozish 💻", callback_data: "tc" }],
-        [{ text: "Xulosa 📝", callback_data: "ts" }],
-        [{ text: "Matematika 🧮", callback_data: "tm2" }],
-        [{ text: "G'oya 💡", callback_data: "ti" }],
-        [{ text: "Tushuntirish 📖", callback_data: "te" }],
-      ]}
-    });
-  }
- 
-  if (text === "📊 Hisobim") {
-    const u = getUser(id);
-    const prem = isPremium(id);
-    const d = daysLeft(id);
-    const until = u.premiumUntil ? new Date(u.premiumUntil).toLocaleDateString() : "-";
-    return bot.sendMessage(id,
-      "Hisobingiz:\n\n" +
-      "Ism: " + (u.name||"-") + "\n" +
-      "ID: " + id + "\n" +
-      "Status: " + (prem ? "Premium 💎" : "Bepul") + "\n" +
-      (prem ? "Muddat: "+until : "Qoldi: "+d+" kun") + "\n" +
-      "Xabarlar: " + (u.count||0)
-    );
-  }
- 
-  if (text === "💎 Premium") return showPremium(id, id);
- 
-  if (text === "ℹ️ Yordam") {
-    return bot.sendMessage(id,
-      "Yordam:\n\n" +
-      "Savol berish - AI ga savol yuboring\n" +
-      "AI tanlash - Groq yoki Cohere\n" +
-      "Vazifalar - tayyor vazifalar\n" +
-      "Hisobim - profil\n" +
-      "Premium - cheksiz foydalanish\n\n" +
-      "Kanal: "+CHANNEL+"\n" +
-      "Muammo: /reset"
-    );
-  }
- 
-  // AI javob
-  const model = models.get(id) || "groq";
-  setUser(id, { name: msg.from.first_name||"", username: msg.from.username||"", lastMsg: new Date().toISOString() });
-  addMsg(id, msg.from.first_name||"", msg.from.username||"", text, model);
-  const u = getUser(id);
-  setUser(id, { count: (u.count||0)+1 });
- 
+  const u = db.getUser(id);
+  const model = u.model || "groq";
+
+  db.addMsg({ id, name: msg.from.first_name || "", uname: msg.from.username || "", text, model });
+  db.setUser(id, { count: (u.count || 0) + 1 });
+
   bot.sendChatAction(id, "typing");
- 
-  if (!histories.has(id)) histories.set(id, []);
-  const hist = histories.get(id);
- 
+  const history = getHistory(id);
+
   try {
-    let reply = "";
- 
-    if (model === "cohere") {
-      const ch = hist.map(h => ({ role: h.role==="user"?"USER":"CHATBOT", message: h.content }));
-      const res = await cohere.chat({ model: "command-a-03-2025", message: text, chatHistory: ch });
-      reply = res.text;
-      hist.push({ role: "user", content: text });
-      hist.push({ role: "assistant", content: reply });
-    } else {
-      hist.push({ role: "user", content: text });
-      const res = await groq.chat.completions.create({ model: "llama-3.3-70b-versatile", messages: hist, max_tokens: 1024 });
-      reply = res.choices[0].message.content;
-      hist.push({ role: "assistant", content: reply });
-    }
- 
+    const reply = await ai.chat({ model, text, history });
+    pushHistory(id, "user", text);
+    pushHistory(id, "assistant", reply);
+
+    let out = reply || "Kechirasiz, javob bo'sh keldi. /reset yozib ko'ring.";
     const d = daysLeft(id);
-    if (!isPremium(id) && d <= 3 && d > 0) reply += "\n\nEslatma: " + d + " kun bepul qoldi! /premium";
- 
-    const chunks = reply.match(/.{1,4000}/gs) || [];
-    for (const chunk of chunks) await bot.sendMessage(id, chunk);
- 
-  } catch (err) {
-    console.error("Xato:", err.message);
-    await bot.sendMessage(id, "Xatolik yuz berdi. /reset yozing.");
+    if (!isPremium(id) && d > 0 && d <= 3) out += `\n\n⏳ Eslatma: bepul muddat tugashiga ${d} kun qoldi. /premium`;
+    await sendLong(id, out, { reply_markup: kb.mainMenu });
+  } catch (e) {
+    console.error("[chat]", e.message);
+    await safeSend(id, "⚠️ AI javob berishda xatolik yuz berdi. Birozdan keyin urinib ko'ring yoki /reset yozing.");
   }
-});
- 
+}
+
+// ============================================================
+//  RASM YARATISH
+// ============================================================
+async function handleImageRequest(id, prompt) {
+  const chk = canGenerateImage(id);
+  if (!chk.ok) return sendImageLimit(id, chk);
+
+  bot.sendChatAction(id, "upload_photo");
+  const wait = await safeSend(id, "🎨 Rasm yaratilmoqda... (15-40 soniya)");
+  try {
+    const { buffer, prompt: used } = await ai.generateImage(prompt);
+    markImageUse(id);
+    db.addMsg({ id, name: "", uname: "", text: "[rasm] " + prompt, model: "image" });
+    await bot.sendPhoto(
+      id,
+      buffer,
+      { caption: "🎨 " + prompt.slice(0, 200), reply_markup: kb.mainMenu },
+      { filename: "image.png", contentType: "image/png" }
+    );
+    if (wait) try { await bot.deleteMessage(id, wait.message_id); } catch {}
+  } catch (e) {
+    console.error("[image]", e.message);
+    if (wait) try { await bot.deleteMessage(id, wait.message_id); } catch {}
+    await safeSend(id, "⚠️ Rasm yaratib bo'lmadi. Boshqacharoq tasvirlab ko'ring yoki keyinroq urinib ko'ring.");
+  }
+}
+
+// ============================================================
+//  VISION — yuborilgan rasmni tahlil qilish
+// ============================================================
+async function handleVision(msg) {
+  const id = msg.from.id;
+  if (!canUse(id)) return sendLimitMessage(id);
+  try {
+    const fileId = msg.photo[msg.photo.length - 1].file_id;
+    const link = await bot.getFileLink(fileId);
+    bot.sendChatAction(id, "typing");
+    const question = (msg.caption || "").trim();
+    const answer = await ai.analyzeImage(link, question);
+    db.addMsg({ id, name: msg.from.first_name || "", uname: msg.from.username || "", text: "[rasm tahlili] " + question, model: "vision" });
+    await sendLong(id, "🖼 " + (answer || "Rasmni tahlil qila olmadim."), { reply_markup: kb.mainMenu });
+  } catch (e) {
+    console.error("[vision]", e.message);
+    await safeSend(id, "⚠️ Rasmni tahlil qilishda xatolik. Keyinroq urinib ko'ring.");
+  }
+}
+
+// ============================================================
+//  VOICE — ovozni matnga aylantirib, javob berish
+// ============================================================
+async function handleVoice(msg) {
+  const id = msg.from.id;
+  if (!canUse(id)) return sendLimitMessage(id);
+  const fileId = (msg.voice || msg.audio).file_id;
+  let filePath = null;
+  try {
+    bot.sendChatAction(id, "typing");
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "voice-"));
+    filePath = await bot.downloadFile(fileId, dir);
+    const text = await ai.transcribe(filePath);
+    if (!text) {
+      await safeSend(id, "🎤 Ovozdan matn ajratib bo'lmadi. Aniqroq gapiring.");
+      return;
+    }
+    await safeSend(id, "🎤 Eshitdim: " + text);
+    if (!canUse(id)) return sendLimitMessage(id);
+    await handleChat(msg, text);
+  } catch (e) {
+    console.error("[voice]", e.message);
+    await safeSend(id, "⚠️ Ovozli xabarni qayta ishlashda xatolik.");
+  } finally {
+    if (filePath) { try { fs.rmSync(path.dirname(filePath), { recursive: true, force: true }); } catch {} }
+  }
+}
+
+// ============================================================
+//  CHEK (to'lov) qabul qilish
+// ============================================================
+async function handleReceipt(msg, st) {
+  const id = msg.from.id;
+  const fileId = msg.photo[msg.photo.length - 1].file_id;
+  const payment = db.addPayment({
+    userId: id,
+    name: msg.from.first_name || "",
+    username: msg.from.username || "",
+    method: st.method || "Karta",
+    amount: config.PREMIUM_SOM,
+    fileId,
+  });
+
+  await safeSend(id, "✅ Chek qabul qilindi! Admin tez orada tekshirib, Premium faollashtiradi. Sabr qiling 🙏");
+
+  if (config.ADMIN_ID) {
+    const cap =
+      "🧾 Yangi to'lov cheki!\n\n" +
+      `👤 ${msg.from.first_name || "-"} @${msg.from.username || "yo'q"}\n` +
+      `🆔 ${id}\n` +
+      `💳 Usul: ${st.method || "Karta"}\n` +
+      `💰 Summa: ${config.PREMIUM_SOM.toLocaleString()} so'm`;
+    try {
+      await bot.sendPhoto(config.ADMIN_ID, fileId, {
+        caption: cap,
+        reply_markup: kb.paymentReviewKeyboard(id, payment.pid),
+      });
+    } catch (e) {
+      console.error("[receipt->admin]", e.message);
+    }
+  }
+}
+
+// ============================================================
+//  PREMIUM / YORDAM / LIMIT xabarlari
+// ============================================================
 function showPremium(chatId, userId) {
   if (isPremium(userId)) {
-    const u = getUser(userId);
+    const u = db.getUser(userId);
     const until = u.premiumUntil ? new Date(u.premiumUntil).toLocaleDateString() : "Cheksiz";
-    return bot.sendMessage(chatId, "Siz Premium foydalanuvchisiz!\nMuddat: "+until);
+    return safeSend(chatId, `💎 Siz Premium foydalanuvchisiz!\n📅 Muddat: ${until}`, { reply_markup: kb.mainMenu });
   }
-  bot.sendMessage(chatId,
-    "Premium obuna - 1 oy\n\nCheksiz savollar\nGroq + Cohere AI\n\nNarx: "+PREMIUM_SOM.toLocaleString()+" so'm\n\nTo'lov usulini tanlang:",
-    { reply_markup: { inline_keyboard: [
-      [{ text: "Payme", callback_data: "pay_payme" }],
-      [{ text: "Click", callback_data: "pay_click" }],
-      [{ text: "Telegram Stars", callback_data: "pay_stars" }],
-    ]}}
+  safeSend(
+    chatId,
+    "💎 PREMIUM OBUNA\n\n" +
+      "✅ Cheksiz savollar\n" +
+      "✅ Cheksiz rasm yaratish\n" +
+      "✅ Rasm va ovoz tahlili\n" +
+      "✅ Barcha AI modellar\n\n" +
+      `💰 Narx: ${config.PREMIUM_SOM.toLocaleString()} so'm / ${config.PREMIUM_MONTHS} oy\n\n` +
+      "To'lov usulini tanlang 👇",
+    { reply_markup: kb.premiumKeyboard() }
   );
 }
- 
-bot.on("pre_checkout_query", q => bot.answerPreCheckoutQuery(q.id, true));
-bot.on("successful_payment", msg => {
-  const id = msg.from.id;
-  const until = new Date(); until.setMonth(until.getMonth()+1);
-  setUser(id, { premium: true, premiumUntil: until.toISOString() });
-  bot.sendMessage(id, "Premium faollashtirildi! 1 oy cheksiz foydalaning!");
-  if (ADMIN_ID) bot.sendMessage(ADMIN_ID, "Stars to'lov! ID: "+id);
+
+function showHelp(chatId) {
+  safeSend(
+    chatId,
+    "ℹ️ YORDAM\n\n" +
+      "🤖 Savol berish — AI ga istalgan savol bering\n" +
+      "🎨 Rasm yaratish — matndan rasm yarataman\n" +
+      "🖼 Rasm yuboring — uni tahlil qilaman\n" +
+      "🎤 Ovozli xabar — matnga aylantirib javob beraman\n" +
+      "📋 Vazifalar — tayyor yordamchilar\n" +
+      "⚙️ AI tanlash — Llama yoki Cohere\n" +
+      "💎 Premium — cheksiz foydalanish\n" +
+      "👥 Do'st taklif qilish — bepul kun yutib oling\n\n" +
+      "Buyruqlar:\n/reset — suhbatni tozalash\n/cancel — amalni bekor qilish\n/image <matn> — tez rasm\n\n" +
+      `📢 Kanal: ${config.CHANNEL}`,
+    { reply_markup: kb.mainMenu }
+  );
+}
+
+function sendLimitMessage(id) {
+  return safeSend(
+    id,
+    "⏳ Bepul muddatingiz tugadi!\n\nCheksiz foydalanish uchun Premium oling 👇",
+    { reply_markup: kb.premiumKeyboard() }
+  );
+}
+
+function sendImageLimit(id, chk) {
+  if (chk.reason === "trial") return sendLimitMessage(id);
+  return safeSend(
+    id,
+    `🎨 Bugungi bepul rasm limiti tugadi (${config.FREE_IMAGE_PER_DAY} ta/kun).\n\n` +
+      "Cheksiz rasm yaratish uchun Premium oling 👇",
+    { reply_markup: kb.premiumKeyboard() }
+  );
+}
+
+// ============================================================
+//  ADMIN matnlari
+// ============================================================
+function statsText() {
+  const data = db.loadDB();
+  const users = Object.values(data.users);
+  const prem = users.filter((u) => isPremium(u.id)).length;
+  const today = new Date().toDateString();
+  const tm = (data.msgs || []).filter((m) => new Date(m.t).toDateString() === today).length;
+  const newToday = users.filter((u) => new Date(u.joined).toDateString() === today).length;
+  return (
+    "📊 STATISTIKA\n\n" +
+    `👥 Jami foydalanuvchi: ${users.length}\n` +
+    `💎 Premium: ${prem}\n` +
+    `🆓 Bepul: ${users.length - prem}\n` +
+    `🆕 Bugun qo'shilgan: ${newToday}\n\n` +
+    `💬 Jami xabarlar: ${data.stats.messages || 0}\n` +
+    `📨 Bugungi xabarlar: ${tm}\n` +
+    `🎨 Jami rasmlar: ${data.stats.images || 0}\n` +
+    `🧾 Kutilayotgan to'lovlar: ${db.pendingPayments().length}`
+  );
+}
+
+function usersText() {
+  const users = db.allUsers().slice(-25).reverse();
+  if (!users.length) return "Foydalanuvchilar yo'q.";
+  let t = "👥 Oxirgi foydalanuvchilar:\n\n";
+  users.forEach((u, i) => {
+    t += `${i + 1}. ${isPremium(u.id) ? "💎" : "🆓"} ${u.name || "-"} @${u.username || "yo'q"} | ${u.id} | ${u.count || 0} 💬\n`;
+  });
+  return t;
+}
+
+function messagesText() {
+  const msgs = (db.loadDB().msgs || []).slice(-15).reverse();
+  if (!msgs.length) return "Xabarlar yo'q.";
+  let t = "💬 Oxirgi xabarlar:\n\n";
+  msgs.forEach((m, i) => {
+    t += `${i + 1}. ${m.name || "-"} [${m.model}]\n${(m.text || "").slice(0, 70)}\n\n`;
+  });
+  return t;
+}
+
+function pendingText() {
+  const ps = db.pendingPayments();
+  if (!ps.length) return "🧾 Kutilayotgan to'lovlar yo'q.";
+  let t = "🧾 Kutilayotgan to'lovlar:\n\n";
+  ps.slice(-15).forEach((p, i) => {
+    t += `${i + 1}. ${p.name || "-"} @${p.username || "yo'q"} | ${p.userId} | ${p.method} | ${new Date(p.t).toLocaleString()}\n`;
+  });
+  t += "\nTasdiqlash uchun chek rasmidagi tugmalardan foydalaning.";
+  return t;
+}
+
+// ============================================================
+//  Ommaviy yuborish (broadcast)
+// ============================================================
+async function broadcast(adminChatId, payload) {
+  const users = db.allUsers();
+  await safeSend(adminChatId, `📤 ${users.length} ta foydalanuvchiga yuborilmoqda...`);
+  let s = 0, f = 0;
+  for (const u of users) {
+    try {
+      if (payload.photo) await bot.sendPhoto(u.id, payload.photo, { caption: payload.caption || "" });
+      else if (payload.video) await bot.sendVideo(u.id, payload.video, { caption: payload.caption || "" });
+      else await bot.sendMessage(u.id, "📢 " + payload.text);
+      s++;
+    } catch {
+      f++;
+    }
+    await new Promise((r) => setTimeout(r, 120));
+  }
+  await safeSend(adminChatId, `✅ Yuborildi: ${s}\n❌ Yuborilmadi: ${f}`);
+}
+
+// ============================================================
+//  TO'LOV (Telegram Stars)
+// ============================================================
+bot.on("pre_checkout_query", (q) => {
+  bot.answerPreCheckoutQuery(q.id, true).catch((e) => console.error("[pre_checkout]", e.message));
 });
- 
-console.log("Bot ishga tushdi!");
- 
+
+bot.on("successful_payment", (msg) => {
+  const id = msg.from.id;
+  const until = grantPremium(id, config.PREMIUM_MONTHS);
+  safeSend(id, `🎉 To'lov muvaffaqiyatli! 💎 Premium faollashtirildi.\nMuddat: ${until.toLocaleDateString()}`);
+  if (config.ADMIN_ID) safeSend(config.ADMIN_ID, `⭐ Stars to'lov! ID: ${id}`);
+});
+
+// ============================================================
+//  XATOLARNI USHLASH
+// ============================================================
+bot.on("polling_error", (e) => console.error("[polling_error]", e.code || "", e.message));
+bot.on("webhook_error", (e) => console.error("[webhook_error]", e.message));
+process.on("unhandledRejection", (e) => console.error("[unhandledRejection]", e && e.message ? e.message : e));
+process.on("uncaughtException", (e) => console.error("[uncaughtException]", e.message));
+
+// ============================================================
+//  ISHGA TUSHIRISH
+// ============================================================
+(async () => {
+  try {
+    const me = await bot.getMe();
+    BOT_USERNAME = me.username;
+    await bot.setMyCommands([
+      { command: "start", description: "Botni ishga tushirish" },
+      { command: "premium", description: "Premium obuna" },
+      { command: "image", description: "Rasm yaratish: /image <matn>" },
+      { command: "reset", description: "Suhbatni tozalash" },
+      { command: "cancel", description: "Amalni bekor qilish" },
+      { command: "help", description: "Yordam" },
+    ]).catch(() => {});
+    console.log(`✅ Bot ishga tushdi: @${BOT_USERNAME}`);
+    console.log(`   Groq: ${ai.hasGroq ? "✓" : "✗"} | Cohere: ${ai.hasCohere ? "✓" : "✗"} | Admin: ${config.ADMIN_ID || "yo'q"}`);
+  } catch (e) {
+    console.error("❌ Ishga tushirishda xato:", e.message);
+  }
+})();
