@@ -9,6 +9,7 @@ const GROQ_KEY = process.env.GROQ_API_KEY;
 const COHERE_KEY = process.env.COHERE_API_KEY;
 const ADMIN_ID = parseInt(process.env.ADMIN_ID) || 0;
 const CHANNEL = process.env.REQUIRED_CHANNEL || "@ustozaka_ai";
+const EXAM_URL = "https://htmlpreview.github.io/?https://github.com/ahmadjoncity/alxorazmiytayyorlov/blob/main/index.html";
 const FREE_DAYS = 20;
 const PREMIUM_SOM = 15000;
 const STARS = 50;
@@ -71,6 +72,7 @@ async function subOk(id) {
  
 const MENU = {
   keyboard: [
+    [{ text: "🎓 Imtihon test" }],
     [{ text: "🤖 Savol berish" }, { text: "⚙️ AI tanlash" }],
     [{ text: "📋 Vazifalar" }, { text: "📊 Hisobim" }],
     [{ text: "💎 Premium" }, { text: "ℹ️ Yordam" }]
@@ -318,6 +320,21 @@ bot.on("message", async (msg) => {
     }
   }
  
+  // Imtihon test menyusi (obunadan keyin har doim ochiq)
+  if (text === "🎓 Imtihon test") {
+    return bot.sendMessage(id,
+      "🎓 Al-Xorazmiy maktabi — 9-sinf imtihon testi\n\n" +
+      "📝 50 ta savol  •  ⏱ 2,5 soat  •  💯 100 ball\n" +
+      "Fanlar: Matematika, Geometriya, Fizika, Ingliz tili\n\n" +
+      "Imtihondan o'tish uchun kamida 60 ball to'plang!\n" +
+      "Quyidagi tugma orqali testni boshlang:",
+      { reply_markup: { inline_keyboard: [
+        [{ text: "🌐 Testni ochish", url: EXAM_URL }],
+        [{ text: "📱 Telegram ichida ochish", web_app: { url: EXAM_URL } }]
+      ]}}
+    );
+  }
+
   // Limit
   if (!canUse(id)) {
     return bot.sendMessage(id, "Bepul muddat tugadi!\n\nPremium oling - cheksiz foydalaning!\n/premium");
@@ -370,6 +387,7 @@ bot.on("message", async (msg) => {
   if (text === "ℹ️ Yordam") {
     return bot.sendMessage(id,
       "Yordam:\n\n" +
+      "Imtihon test - 9-sinf imtihoniga tayyorgarlik (50 ta savol)\n" +
       "Savol berish - AI ga savol yuboring\n" +
       "AI tanlash - Groq yoki Cohere\n" +
       "Vazifalar - tayyor vazifalar\n" +
