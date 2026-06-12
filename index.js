@@ -37,12 +37,17 @@ if (!CHANNEL.startsWith("@")) {
 }
 
 // ---------------- DB ----------------
-const DB_PATH = path.join(__dirname, "db.json");
+// DB fayl yo'li. Railway/Render kabi platformalarda fayl tizimi vaqtinchalik bo'lgani
+// uchun Volume ulab, DB_FILE=/data/db.json qilib bering (aks holda har deployda o'chadi!).
+const DB_PATH = process.env.DB_FILE || path.join(__dirname, "db.json");
 let dbCache = null;
 
 function loadDB() {
   if (dbCache) return dbCache;
   try {
+    // DB papkasi mavjudligini ta'minlash (masalan Volume: /data)
+    const dir = path.dirname(DB_PATH);
+    if (dir && !fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     if (!fs.existsSync(DB_PATH)) {
       dbCache = { users: {}, msgs: [] };
       saveDB();
@@ -51,6 +56,19 @@ function loadDB() {
     dbCache = JSON.parse(fs.readFileSync(DB_PATH, "utf8"));
     if (!dbCache.users) dbCache.users = {};
     if (!dbCache.msgs)  dbCache.msgs  = [];
+    // Migratsiya: eski/buzuq yozuvlarda 'joined' yo'q bo'lsa to'ldiramiz.
+    // Bu "NaN kun qoldi" xatosini ham tuzatadi.
+    let migrated = false;
+    for (const uid of Object.keys(dbCache.users)) {
+      const u = dbCache.users[uid];
+      if (!u || typeof u !== "object") continue;
+      if (!u.joined || !Number.isFinite(new Date(u.joined).getTime())) {
+        u.joined = new Date().toISOString();
+        migrated = true;
+      }
+      if (u.id === undefined) u.id = isNaN(parseInt(uid, 10)) ? uid : parseInt(uid, 10);
+    }
+    if (migrated) flushDB();
   } catch (e) {
     console.error("DB o'qib bo'lmadi, yangidan yaratildi:", e.message);
     dbCache = { users: {}, msgs: [] };
@@ -102,8 +120,12 @@ function getUser(id) {
 }
 
 function setUser(id, data) {
+  // MUHIM: avval getUser chaqiramiz — bu default maydonlar (joined, firstUseAt, ...)
+  // borligini kafolatlaydi. Aks holda yangi user faqat 'data' bilan yaratilib,
+  // 'joined' yo'q bo'lib qoladi va daysLeft "NaN" qaytaradi.
+  const base = getUser(id);
   const db = loadDB();
-  db.users[id] = Object.assign({}, db.users[id], data);
+  db.users[id] = Object.assign({}, base, data);
   saveDB();
 }
 
@@ -127,10 +149,13 @@ function isPremium(id) {
 
 function daysLeft(id) {
   const u = getUser(id);
+  const freeDays = Number.isFinite(FREE_DAYS) ? FREE_DAYS : 20;
   // Bepul muddat birinchi foydalanishdan boshlab, agar yo'q bo'lsa joined dan
-  const start = u.firstUseAt || u.joined;
-  const diff = (Date.now() - new Date(start).getTime()) / 86400000;
-  return Math.max(0, FREE_DAYS - Math.floor(diff));
+  const startRaw = u.firstUseAt || u.joined;
+  let startMs = new Date(startRaw).getTime();
+  if (!Number.isFinite(startMs)) startMs = Date.now(); // sana buzuq/yo'q bo'lsa, bugundan
+  const diff = (Date.now() - startMs) / 86400000;
+  return Math.max(0, freeDays - Math.floor(diff));
 }
 
 function canUseAI(id) {
@@ -766,3 +791,4 @@ process.on("uncaughtException",  (e) => console.error("uncaughtException:",  e))
 process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e));
 
 console.log("Bot ishga tushdi! Admin ID: " + ADMIN_ID + ", Kanal: " + CHANNEL);
+console.log("DB fayl: " + DB_PATH + " | Bepul kun: " + FREE_DAYS);
